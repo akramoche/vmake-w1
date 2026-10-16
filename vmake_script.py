@@ -65,6 +65,8 @@ DEFAULTS = {
     "run_lookup_timeout":  180,    # temps max pour voir apparaître le run après dispatch
     "artifact_retention":  7,      # jours
     "min_tail_duration":   2.0,    # fusionne le dernier morceau s'il est plus court
+    "vmake_trim":          0.1,    # secondes rognees par Vmake au DEBUT de chaque morceau
+                                   # (mesure : 3 images a 30 i/s). 0 = desactive.
 }
 
 FOLDERS = {
@@ -196,22 +198,24 @@ def _run_ffmpeg(cmd: list, what: str):
         raise RuntimeError(f"{what} a échoué (ffmpeg code {r.returncode}) :\n{tail}")
 
 
-def _encode_chunk(input_path: Path, out_path: Path, start: float, length: float):
+def _encode_chunk(input_path: Path, out_path: Path, start: float, length: float,
+                  has_audio: bool = True):
     """Encode un morceau à position exacte, à partir de `start`, sur `length` secondes."""
-    _run_ffmpeg([
-        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
-        "-ss", f"{start:.3f}", "-i", str(input_path),
-        "-t", f"{length:.3f}",
-        "-map", "0:v:0", "-map", "0:a?",
-        "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
-        "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
-        "-reset_timestamps", "1",
-        str(out_path),
-    ], f"L'encodage du morceau {out_path.name}")
+    cmd = ["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+           "-ss", f"{start:.3f}", "-i", str(input_path),
+           "-t", f"{length:.3f}",
+           "-map", "0:v:0"]
+    if has_audio:
+        cmd += ["-map", "0:a?"]
+    cmd += ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", "-b:a", "192k", "-ar", "44100", "-ac", "2",
+            "-reset_timestamps", "1",
+            str(out_path)]
+    _run_ffmpeg(cmd, f"L'encodage du morceau {out_path.name}")
 
 
 def split_video(input_path: Path, out_dir: Path, chunk_duration: int,
-                cap: float = 5.0) -> list:
+                cap: float = 5.0, preroll: float = 0.0) -> list:
     """
     Découpe en morceaux de durée exacte (correctif 1).
 
@@ -238,13 +242,40 @@ def split_video(input_path: Path, out_dir: Path, chunk_duration: int,
     if total <= 0:
         raise RuntimeError(f"Durée illisible pour {input_path.name}")
 
+    # Une video sans piste audio est valide : on ne tente pas de la retarder.
+    has_audio = any(s.get("codec_type") == "audio" for s in probe(input_path)["streams"])
+
     n = max(1, int(total // chunk_duration) + (1 if total % chunk_duration else 0))
     for i in range(n):
         start  = i * chunk_duration
         length = min(chunk_duration, total - start)
         if length <= 0:
             break
-        _encode_chunk(input_path, out_dir / f"chunk_{i:03d}.mp4", start, length)
+
+        # `preroll` : Vmake rogne systematiquement les 3 PREMIERES images (0,1 s) de
+        # chaque morceau qu'on lui envoie (mesure le 16/10/2026 : 3 images sur 120
+        # pour CHACUN des 21 morceaux, 1,97 % de la video au total).
+        # On lui donne donc `preroll` secondes d'avance qu'il consommera : la coupe
+        # qu'il fait tombe exactement sur le debut voulu, et le contenu est preserve.
+        #
+        # Premier morceau : il n'existe rien avant t=0 a lui donner en avance. On le
+        # laisse tel quel : Vmake en rognera les 0,1 s, soit 3 images perdues au tout
+        # debut de la video — invisible, et de loin preferable aux deux alternatives
+        # testees : geler la premiere image produit un micro-blocage de 0,1 s ET
+        # decale le son (mesure le 16/10/2026).
+        pre = preroll if i > 0 else 0.0
+        src_start = max(0.0, start - pre)
+        src_len   = length + (start - src_start)
+
+        # Le plafond Vmake (5 s) ne doit jamais etre franchi : on retire l'avance
+        # du morceau plutot que de risquer une troncature silencieuse.
+        if src_len > cap:
+            excess = src_len - cap
+            src_start += excess
+            src_len   -= excess
+
+        _encode_chunk(input_path, out_dir / f"chunk_{i:03d}.mp4", src_start, src_len,
+                      has_audio=has_audio)
 
     chunks = sorted(out_dir.glob("chunk_*.mp4"))
 
@@ -1047,8 +1078,12 @@ def run_local(args) -> int:
 
     chunks = sorted(chunks_dir.glob("chunk_*.mp4"))
     if not chunks:
+        trim = float(cfg.get("vmake_trim", 0.0))
         log(f"\n✂️  Découpage en morceaux de {cfg['chunk_duration']}s (réencodage, images-clés forcées)...")
-        chunks = split_video(input_path, chunks_dir, int(cfg["chunk_duration"]))
+        if trim:
+            log(f"   ↳ compensation du rognage Vmake : +{trim:.3f}s d'avance par morceau")
+        chunks = split_video(input_path, chunks_dir, int(cfg["chunk_duration"]),
+                             preroll=trim)
         chunks = merge_short_tail(chunks, float(cfg["min_tail_duration"]))
         durations = [duration_of(c) for c in chunks]
         log(f"   ✅ {len(chunks)} morceaux — "
