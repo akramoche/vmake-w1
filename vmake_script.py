@@ -797,12 +797,15 @@ def build_chunk_zip(chunks: list, dest: Path) -> Path:
 def ensure_chunks_on_worker(worker: dict, release_tag: str, zip_path: Path, zip_name: str,
                             state: dict, lock):
     """Dépose le paquet de morceaux dans une Release du dépôt, une seule fois."""
+    # Le verrou couvre TOUTE l'opération, pas seulement le test : plusieurs jobs
+    # d'une même vague partagent le même dépôt. Sans cela, deux threads créent la
+    # release puis téléversent l'asset en même temps, et le second reçoit
+    # « HTTP 404 » sur l'upload (constaté le 16/10/2026 avec 3 jobs).
     with lock:
         if worker["full"] in state.setdefault("release_ready", []):
             return
-    release = worker["gh"].ensure_release(release_tag, f"Morceaux {release_tag}")
-    worker["gh"].upload_asset(release, zip_name, zip_path.read_bytes())
-    with lock:
+        release = worker["gh"].ensure_release(release_tag, f"Morceaux {release_tag}")
+        worker["gh"].upload_asset(release, zip_name, zip_path.read_bytes())
         state["release_ready"].append(worker["full"])
 
 
