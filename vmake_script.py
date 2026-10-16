@@ -625,9 +625,20 @@ class GitHub:
         r = self.req("GET", f"/repos/{self.label}/releases/tags/{tag}", expect=(200, 404))
         if r.status_code == 200:
             return r.json()
-        return self.req("POST", f"/repos/{self.label}/releases", expect=(201,), json={
+
+        # 422 : deux jobs simultanes sur le MEME depot creent la release en meme
+        # temps ; le second recoit un 422 trompeur (« must have a valid tag »)
+        # alors que la release existe bel et bien. On la relit au lieu d'echouer.
+        r = self.req("POST", f"/repos/{self.label}/releases", expect=(201, 422), json={
             "tag_name": tag, "name": name, "draft": False, "prerelease": False,
-        }).json()
+        })
+        if r.status_code == 201:
+            return r.json()
+
+        r = self.req("GET", f"/repos/{self.label}/releases/tags/{tag}", expect=(200, 404))
+        if r.status_code == 200:
+            return r.json()
+        raise GitHubError(f"{self.label} release « {tag} » introuvable après création")
 
     def upload_asset(self, release: dict, filename: str, data: bytes) -> dict:
         for a in release.get("assets", []):
