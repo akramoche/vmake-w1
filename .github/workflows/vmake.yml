@@ -1,5 +1,12 @@
 name: vmake-worker
 
+# run-name : SANS cette ligne, GitHub nomme TOUS les runs « vmake-chunk » (le type
+# de l'evenement). Le script local, lui, cherche « vmake-<job_id> » pour retrouver
+# SON run parmi les autres. Sans run-name, find_run ne trouve jamais rien : les jobs
+# tournent, mais le script attend puis abandonne en « timeout ».
+# Verifie le 16/10/2026 : display_title valait 'vmake-chunk' au lieu de 'vmake-PLUMBING-TEST'.
+run-name: vmake-${{ github.event.client_payload.job_id }}
+
 # Ce workflow ne se déclenche QUE par appel direct du script local (repository_dispatch).
 # Il ne contient aucun média : les morceaux arrivent par une Release, les résultats
 # repartent en artifact. Aucun `git push`, donc aucun conflit possible.
