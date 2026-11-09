@@ -86,5 +86,9 @@ jobs:
         with:
           name: vmake-result-${{ github.event.client_payload.job_id }}
           path: out/
-          retention-days: 7
+          # 1 jour : le script récupère les résultats dans la minute qui suit
+          # la fin du job. Le stockage d'artifacts n'est PAS gratuit en public
+          # (500 Mo sur tout le compte) : garder 7 jours ferait saturer le
+          # quota, alors que 1 jour suffit largement.
+          retention-days: 1
           if-no-files-found: warn
