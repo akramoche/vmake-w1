@@ -63,7 +63,7 @@ DEFAULTS = {
     "max_waves":           30,     # garde-fou anti-boucle
     "job_timeout":         2700,   # 45 min : temps max d'un job distant
     "run_lookup_timeout":  180,    # temps max pour voir apparaître le run après dispatch
-    "artifact_retention":  7,      # jours
+    "artifact_retention":  1,      # jours
     "min_tail_duration":   2.0,    # fusionne le dernier morceau s'il est plus court
     "vmake_trim":          0.1,    # secondes rognees par Vmake au DEBUT de chaque morceau
                                    # (mesure : 3 images a 30 i/s). 0 = desactive.
@@ -104,11 +104,13 @@ def load_dotenv(path: Path):
 class Account:
     """Un compte GitHub (Akram ou un ami) et ses dépôts-travailleurs."""
 
-    def __init__(self, name: str, owner: str, workers: list, token: str):
-        self.name    = name
-        self.owner   = owner
-        self.workers = workers
-        self.token   = token
+    def __init__(self, name: str, owner: str, workers: list, token: str,
+                 parallel_cap: int | None = None):
+        self.name         = name
+        self.owner        = owner
+        self.workers      = workers
+        self.token        = token
+        self.parallel_cap = parallel_cap
 
     def worker_full_names(self):
         return [f"{self.owner}/{w}" for w in self.workers]
@@ -140,6 +142,7 @@ def load_accounts(path: Path) -> dict:
         owner   = raw.get("owner", "").strip()
         workers = [w.strip() for w in raw.get("workers", []) if w.strip()]
         env_key = raw.get("token_env") or f"GITHUB_TOKEN_{name.upper().replace('-', '_')}"
+        cap     = raw.get("parallel_cap")   # plafond propre à CE compte
 
         if not owner:
             sys.exit(f"❌ Compte « {name} » : le champ 'owner' est vide.")
@@ -160,7 +163,8 @@ def load_accounts(path: Path) -> dict:
                 sys.exit(f"❌ Dépôt en double dans accounts.json : {full}")
             seen.add(full)
 
-        accounts.append(Account(name, owner, workers, token))
+        accounts.append(Account(name, owner, workers, token,
+                                int(cap) if cap is not None else None))
 
     settings["_accounts"] = accounts
     return settings
@@ -641,6 +645,17 @@ class GitHub:
         })
         return r.status_code == 201
 
+    def visibility(self) -> bool | None:
+        """True si le dépôt est public, False s'il est privé, None s'il n'existe pas."""
+        r = self.req("GET", f"/repos/{self.label}", expect=(200, 404))
+        if r.status_code == 404:
+            return None
+        return not r.json()["private"]
+
+    def set_visibility(self, public: bool):
+        self.req("PATCH", f"/repos/{self.label}",
+                 json={"private": not public}, expect=(200,))
+
     def put_file(self, path: str, data: bytes, message: str):
         """Crée ou met à jour un fichier du dépôt via l'API (aucun git local requis)."""
         r   = self.req("GET", f"/repos/{self.label}/contents/{path}", expect=(200, 404))
@@ -725,6 +740,23 @@ def video_id_for(input_path: Path) -> str:
     return f"{safe}-{stamp}"
 
 
+def session_for(input_path: Path, reset: bool) -> str:
+    """
+    Retrouve la session d'une vidéo déjà commencée, ou en ouvre une neuve.
+
+    Sans ça, chaque relance créait un nouvel identifiant, donc un nouveau dossier :
+    la « reprise » annoncée repartait de zéro et refaisait tout le travail déjà
+    payé. `--reset` force une session neuve.
+    """
+    safe = "".join(c for c in input_path.stem if c.isalnum() or c in "-_")[:32]
+    if not reset:
+        existantes = [d for d in FOLDERS["state"].glob(f"{safe}-*") if d.is_dir()]
+        if existantes:
+            # La plus récente : c'est la seule qui puisse contenir un travail utile.
+            return max(existantes, key=lambda d: d.stat().st_mtime).name
+    return video_id_for(input_path)
+
+
 def save_state(state_dir: Path, name: str, data: dict):
     state_dir.mkdir(parents=True, exist_ok=True)
     (state_dir / name).write_text(json.dumps(data, indent=2), encoding="utf-8")
@@ -802,20 +834,32 @@ def run_action(args) -> int:
 # MODE LOCAL — orchestration multi-comptes
 # ============================================================
 def build_workers(cfg: dict) -> list:
-    """Construit la liste des dépôts-travailleurs, un job parallèle par dépôt."""
+    """
+    Construit la liste des dépôts-travailleurs.
+
+    Le plafond `max_parallel_cap` s'applique PAR COMPTE, pas au total. Sinon
+    ajouter des amis ne servirait à rien : avec 3 comptes et un plafond global
+    de 12, on croit paralléliser alors que 12 jobs restent 12 jobs. Chaque
+    compte a son propre quota GitHub (20 jobs simultanés), donc son propre
+    plafond.
+    """
     workers = []
     for acc in cfg["_accounts"]:
-        for w in acc.workers:
+        per_account = int(acc.parallel_cap or cfg["max_parallel_cap"])
+        for n, w in enumerate(acc.workers):
             workers.append({
-                "account": acc,
-                "repo":    w,
-                "full":    f"{acc.owner}/{w}",
-                "gh":      GitHub(acc.token, acc.owner, w),
+                "account":    acc,
+                "repo":       w,
+                "full":       f"{acc.owner}/{w}",
+                "slot":       n,
+                "per_account": per_account,
+                "gh":         GitHub(acc.token, acc.owner, w),
             })
-    cap = min(len(workers), int(cfg["max_parallel_cap"]))
+    total = sum(int(a.parallel_cap or cfg["max_parallel_cap"])
+                for a in cfg["_accounts"] if a.workers)
     log(f"👥 {len(cfg['_accounts'])} compte(s), {len(workers)} dépôt(s) travailleur(s) "
-        f"→ jusqu'à {cap} job(s) simultané(s) par dépôt")
-    return workers[:cap]
+        f"→ jusqu'à {total} job(s) simultané(s)")
+    return workers
 
 
 def build_chunk_zip(chunks: list, dest: Path) -> Path:
@@ -944,18 +988,41 @@ def orchestrate(cfg: dict, state_dir: Path, video_id: str, chunks: list) -> list
 
     # Un même dépôt peut héberger plusieurs jobs EN MÊME TEMPS : un compte
     # GitHub gratuit autorise 20 jobs simultanés. On ne se limite donc pas au
-    # nombre de dépôts, sinon un seul dépôt = un seul job = 45 min par vidéo au
-    # lieu de 18. `max_parallel_cap` est le vrai plafond.
-    cap = max(1, int(cfg["max_parallel_cap"]))
+    # nombre de dépôts, sinon un seul dépôt = un seul job = 45 min par vidéo.
+    #
+    # La répartition se fait dans un cycle qui parcourt les comptes un par un.
+    # Chaque compte ne reçoit jamais plus que SON plafond : si un compte a un
+    # seul dépôt et que son plafond est de 12, ses jobs tournent tous sur ce
+    # dépôt. C'est ce qui permet d'avoir plusieurs comptes en parallèle sans
+    # qu'un compte lent ou limité bloque les autres.
+    def plan(n_jobs: int) -> list:
+        """Associe chaque job à un dépôt, en respectant le plafond de chaque compte."""
+        use = [0] * len(workers)
+        assigned = []
+        n = 0
+        while len(assigned) < n_jobs:
+            progressed = False
+            for i, w in enumerate(workers):
+                if use[i] >= w["per_account"]:
+                    continue
+                assigned.append(w)
+                use[i] += 1
+                progressed = True
+                if len(assigned) >= n_jobs:
+                    break
+            if not progressed:
+                break
+        return assigned
 
     while remaining and wave < cfg["max_waves"]:
         wave += 1
         jobs = []
-        for n in range(min(cap, (len(remaining) + group - 1) // group)):
+        n_jobs = min(sum(w["per_account"] for w in workers),
+                     (len(remaining) + group - 1) // group)
+        for n, worker in enumerate(plan(n_jobs)):
             idxs = remaining[n * group:(n + 1) * group]
             if not idxs:
                 break
-            worker = workers[(n + wave - 1) % len(workers)]
             job_id = f"{video_id[-6:]}-v{wave}j{n + 1}"
             jobs.append({
                 "job_id": job_id, "idxs": idxs, "worker": worker,
@@ -1065,15 +1132,18 @@ def run_local(args) -> int:
     if not input_path.exists():
         sys.exit(f"❌ Fichier introuvable : {input_path}")
 
-    video_id  = video_id_for(input_path)
-    state_dir = FOLDERS["state"] / video_id
+    video_id   = session_for(input_path, args.reset)
+    state_dir  = FOLDERS["state"] / video_id
     chunks_dir = state_dir / "chunks"
 
     log(f"\n🚀 Traitement de « {input_path.name} »")
     log(f"   identifiant de session : {video_id}")
-
-    if args.reset and state_dir.exists():
-        shutil.rmtree(state_dir)
+    if args.reset:
+        # La session neuve n'existe pas encore : on efface les anciennes traces.
+        for vieille in FOLDERS["state"].glob(
+                f"{''.join(c for c in input_path.stem if c.isalnum() or c in '-_')[:32]}-*"):
+            if vieille.is_dir() and vieille.name != video_id:
+                shutil.rmtree(vieille, ignore_errors=True)
         log("   ♻️  état précédent effacé")
 
     chunks = sorted(chunks_dir.glob("chunk_*.mp4"))
